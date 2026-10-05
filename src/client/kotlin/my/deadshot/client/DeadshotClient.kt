@@ -8,83 +8,96 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 import net.minecraft.ChatFormatting
 import net.minecraft.client.KeyMapping
-import net.minecraft.client.Minecraft
-import net.minecraft.core.Direction
 import net.minecraft.network.chat.Component
 import net.minecraft.resources.Identifier
 import net.minecraft.util.Mth
 import net.minecraft.world.entity.LivingEntity
 import net.minecraft.world.entity.decoration.ArmorStand
-import net.minecraft.world.entity.monster.Enemy
 import net.minecraft.world.entity.player.Player
 import net.minecraft.world.item.BowItem
 import net.minecraft.world.item.CrossbowItem
-import net.minecraft.world.item.Items
-import net.minecraft.world.phys.AABB
 import net.minecraft.world.phys.Vec3
 
 object DeadshotClient : ClientModInitializer {
     private const val MOD_ID = "deadshot"
-    private var enabled = true
-    private lateinit var toggleKey: KeyMapping
+
+    private var bowAimEnabled = true
+    private var meleeAimEnabled = true
+
+    private lateinit var toggleBowKey: KeyMapping
+    private lateinit var toggleMeleeKey: KeyMapping
 
     override fun onInitializeClient() {
         val category = KeyMapping.Category.register(Identifier.fromNamespaceAndPath(MOD_ID, "main"))
-        // زر تفعيل / تعطيل الايم (حرف V افتراضياً)
-        toggleKey = KeyMappingHelper.registerKeyMapping(
-            KeyMapping("key.deadshot.toggle", InputConstants.KEY_V, category)
+
+        // زر تفعيل/تعطيل ايم القوس (حرف V)
+        toggleBowKey = KeyMappingHelper.registerKeyMapping(
+            KeyMapping("key.deadshot.toggle_bow", InputConstants.KEY_V, category)
+        )
+
+        // زر تفعيل/تعطيل الايم العام لجميع الأسلحة ولليد الفارغة (حرف X)
+        toggleMeleeKey = KeyMappingHelper.registerKeyMapping(
+            KeyMapping("key.deadshot.toggle_melee", InputConstants.KEY_X, category)
         )
 
         ClientTickEvents.END_CLIENT_TICK.register { client ->
             val player = client.player ?: return@register
 
-            while (toggleKey.consumeClick()) {
-                enabled = !enabled
-                val status = if (enabled) Component.literal("ON").withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD)
-                else Component.literal("OFF").withStyle(ChatFormatting.RED, ChatFormatting.BOLD)
-                player.sendSystemMessage(Component.literal("[Deadshot] ").withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD).append(status))
+            while (toggleBowKey.consumeClick()) {
+                bowAimEnabled = !bowAimEnabled
+                notify(player, "Bow Aim", bowAimEnabled)
             }
 
-            if (!enabled || client.screen != null) return@register
+            while (toggleMeleeKey.consumeClick()) {
+                meleeAimEnabled = !meleeAimEnabled
+                notify(player, "General Aim", meleeAimEnabled)
+            }
+
+            if (client.screen != null) return@register
 
             handleAim(player)
         }
     }
 
+    private fun notify(player: Player, name: String, state: Boolean) {
+        val status = if (state) Component.literal("ON").withStyle(ChatFormatting.GREEN, ChatFormatting.BOLD)
+        else Component.literal("OFF").withStyle(ChatFormatting.RED, ChatFormatting.BOLD)
+        player.sendSystemMessage(
+            Component.literal("[Deadshot] ").withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD)
+                .append(Component.literal("$name: ").withStyle(ChatFormatting.WHITE))
+                .append(status)
+        )
+    }
+
     private fun handleAim(player: Player) {
-        val mainItem = player.mainHandItem.item
         val isBow = player.isUsingItem && (player.useItem.item is BowItem || player.useItem.item is CrossbowItem)
-        val isMace = mainItem == Items.MACE
 
-        if (!isBow && !isMace) return
-
-        // المدى: 45 بلوكة للقوس، و 5 بلوكات للـ Mace
-        val range = if (isBow) 45.0 else 5.0
-        val target = findBestTarget(player, range) ?: return
-
-        if (isBow) {
+        // 1. نظام القوس (يشتغل عند شد القوس إذا كان مفعل بزر V)
+        if (isBow && bowAimEnabled) {
+            val target = findTarget(player, 45.0) ?: return
             aimBow(player, target)
-        } else if (isMace) {
+            return
+        }
+
+        // 2. نظام الايم العام (لأي سلاح أو بدون سلاح إذا كان مفعل بزر X)
+        if (meleeAimEnabled && !isBow) {
+            val target = findTarget(player, 5.5) ?: return
             aimDirect(player, target.boundingBox.center)
         }
     }
 
-    // البحث عن أقرب هدف حي (مع إعطاء الأولوية للوحوش وتجاهل ما وراء الجدران)
-    private fun findBestTarget(player: Player, range: Double): LivingEntity? {
+    // يبحث عن أقرب هدف حي (سواء لاعب Player أو وحش Mob) بدون تمييز
+    private fun findTarget(player: Player, range: Double): LivingEntity? {
         val level = player.level()
         val box = player.boundingBox.inflate(range)
         val entities = level.getEntitiesOfClass(LivingEntity::class.java, box) {
             it != player && it.isAlive && it !is ArmorStand && player.hasLineOfSight(it)
         }
 
-        return entities.minByOrNull { entity ->
-            val dist = player.distanceTo(entity)
-            // إعطاء أولوية للوحوش (Enemy)
-            if (entity is Enemy) dist else dist + 10.0
-        }
+        return entities.minByOrNull { player.distanceTo(it) }
     }
 
-    // توجيه الايم المباشر (للـ Mace)
+    // توجيه الايم المباشر (للأيدي، السيوف، الميس، وأي أداة)
     private fun aimDirect(player: Player, targetPos: Vec3) {
         val eyePos = player.eyePosition
         val dx = targetPos.x - eyePos.x
@@ -99,7 +112,7 @@ object DeadshotClient : ClientModInitializer {
         player.xRot = pitch
     }
 
-    // توجيه الايم البالستي للقوس (حساب الجاذبية والمسافة)
+    // توجيه الايم مع حساب جاذبية ومسار السهم
     private fun aimBow(player: Player, target: LivingEntity) {
         val eyePos = player.eyePosition
         val targetPos = target.boundingBox.center
@@ -107,17 +120,14 @@ object DeadshotClient : ClientModInitializer {
         val dz = targetPos.z - eyePos.z
         val horizontalDist = sqrt(dx * dx + dz * dz)
 
-        // حساب قوة شد القوس
         val useTicks = player.useItem.useDuration - player.useItemRemainingTicks
         var velocity = BowItem.getPowerForTime(useTicks).toDouble() * 3.0
-        if (velocity < 0.1) velocity = 1.0 // سرعة افتراضية كحد أدنى
+        if (velocity < 0.1) velocity = 1.0
 
-        // معادلة سقوط السهم بفعل الجاذبية في ماينكرافت (Gravity compensation)
         val gravity = 0.05
         val time = horizontalDist / velocity
         val drop = 0.5 * gravity * time * time
 
-        // استهداف منتصف جسم الكائن مع رفع الزاوية لتعويض السقوط
         val targetY = targetPos.y + drop
         val dy = targetY - eyePos.y
 
