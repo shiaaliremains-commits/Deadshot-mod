@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper
 import net.minecraft.ChatFormatting
 import net.minecraft.client.KeyMapping
+import net.minecraft.client.Minecraft
 import net.minecraft.network.chat.Component
 import net.minecraft.resources.Identifier
 import net.minecraft.util.Mth
@@ -26,6 +27,7 @@ object DeadshotClient : ClientModInitializer {
 
     private lateinit var toggleBowKey: KeyMapping
     private lateinit var toggleMeleeKey: KeyMapping
+    private var screenProbe: ((Minecraft) -> Any?)? = null
 
     override fun onInitializeClient() {
         val category = KeyMapping.Category.register(Identifier.fromNamespaceAndPath(MOD_ID, "main"))
@@ -53,10 +55,36 @@ object DeadshotClient : ClientModInitializer {
                 notify(player, "General Aim", meleeAimEnabled)
             }
 
-            if (client.screen != null) return@register
+            if (isScreenOpen(client)) return@register
 
             handleAim(player)
         }
+    }
+
+    private fun buildScreenProbe(mc: Minecraft): (Minecraft) -> Any? {
+        val guiField = runCatching { mc.javaClass.getField("gui") }.getOrNull()
+        val gui = guiField?.let { runCatching { it.get(mc) }.getOrNull() }
+        val guiMethod = gui?.javaClass?.methods?.firstOrNull { it.name == "screen" && it.parameterCount == 0 }
+        if (guiField != null && guiMethod != null) {
+            return { m -> runCatching { guiMethod.invoke(guiField.get(m)) }.getOrNull() }
+        }
+
+        val mcMethod = mc.javaClass.methods.firstOrNull { it.name == "screen" && it.parameterCount == 0 }
+        if (mcMethod != null) {
+            return { m -> runCatching { mcMethod.invoke(m) }.getOrNull() }
+        }
+
+        val mcField = runCatching { mc.javaClass.getField("screen") }.getOrNull()
+        if (mcField != null) {
+            return { m -> runCatching { mcField.get(m) }.getOrNull() }
+        }
+
+        return { _ -> null }
+    }
+
+    private fun isScreenOpen(client: Minecraft): Boolean {
+        val probe = screenProbe ?: buildScreenProbe(client).also { screenProbe = it }
+        return probe(client) != null
     }
 
     private fun notify(player: Player, name: String, state: Boolean) {
@@ -72,21 +100,20 @@ object DeadshotClient : ClientModInitializer {
     private fun handleAim(player: Player) {
         val isBow = player.isUsingItem && (player.useItem.item is BowItem || player.useItem.item is CrossbowItem)
 
-        // 1. نظام القوس (يشتغل عند شد القوس إذا كان مفعل بزر V)
+        // 1. نظام القوس
         if (isBow && bowAimEnabled) {
             val target = findTarget(player, 45.0) ?: return
             aimBow(player, target)
             return
         }
 
-        // 2. نظام الايم العام (لأي سلاح أو بدون سلاح إذا كان مفعل بزر X)
+        // 2. نظام الايم العام (لأي سلاح أو بدون سلاح)
         if (meleeAimEnabled && !isBow) {
             val target = findTarget(player, 5.5) ?: return
             aimDirect(player, target.boundingBox.center)
         }
     }
 
-    // يبحث عن أقرب هدف حي (سواء لاعب Player أو وحش Mob) بدون تمييز
     private fun findTarget(player: Player, range: Double): LivingEntity? {
         val level = player.level()
         val box = player.boundingBox.inflate(range)
@@ -97,7 +124,6 @@ object DeadshotClient : ClientModInitializer {
         return entities.minByOrNull { player.distanceTo(it) }
     }
 
-    // توجيه الايم المباشر (للأيدي، السيوف، الميس، وأي أداة)
     private fun aimDirect(player: Player, targetPos: Vec3) {
         val eyePos = player.eyePosition
         val dx = targetPos.x - eyePos.x
@@ -112,7 +138,6 @@ object DeadshotClient : ClientModInitializer {
         player.xRot = pitch
     }
 
-    // توجيه الايم مع حساب جاذبية ومسار السهم
     private fun aimBow(player: Player, target: LivingEntity) {
         val eyePos = player.eyePosition
         val targetPos = target.boundingBox.center
@@ -120,7 +145,8 @@ object DeadshotClient : ClientModInitializer {
         val dz = targetPos.z - eyePos.z
         val horizontalDist = sqrt(dx * dx + dz * dz)
 
-        val useTicks = player.useItem.useDuration - player.useItemRemainingTicks
+        // حساب وقت الشد بدقة عبر ticksUsingItem
+        val useTicks = player.ticksUsingItem
         var velocity = BowItem.getPowerForTime(useTicks).toDouble() * 3.0
         if (velocity < 0.1) velocity = 1.0
 
