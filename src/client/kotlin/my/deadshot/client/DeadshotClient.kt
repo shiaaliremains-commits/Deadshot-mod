@@ -28,10 +28,6 @@ object DeadshotClient : ClientModInitializer {
     private var meleeAimEnabled = true
     private var lockedTarget: LivingEntity? = null
 
-    // ذاكرة متقدمة لحفظ وتنعيم سرعة الكائنات
-    private val lastPositions = HashMap<Int, Vec3>()
-    private val smoothedVelocities = HashMap<Int, Vec3>()
-
     private lateinit var toggleBowKey: KeyMapping
     private lateinit var toggleMeleeKey: KeyMapping
     private var screenProbe: ((Minecraft) -> Any?)? = null
@@ -108,13 +104,12 @@ object DeadshotClient : ClientModInitializer {
         return player.hasLineOfSight(target)
     }
 
-    // نقطة استهداف ذكية لارتفاع الصدر والرأس بدل الرجلين
+    // نقطة الصدر بدقة (60% من طول الكائن)
     private fun getAimPoint(target: LivingEntity): Vec3 {
         val bb = target.boundingBox
         val height = bb.maxY - bb.minY
-        // للكائنات الصغيرة نأخذ أعلى الصدر، وللكائنات العادية 70% من الارتفاع (منطقة الصدر/الرأس)
-        val yOffset = if (height < 1.0) height * 0.55 else height * 0.70
-        return Vec3(bb.minX + (bb.maxX - bb.minX) * 0.5, bb.minY + yOffset, bb.minZ + (bb.maxZ - bb.minZ) * 0.5)
+        val yOffset = height * 0.60
+        return Vec3(target.x, bb.minY + yOffset, target.z)
     }
 
     private fun handleAim(player: Player) {
@@ -128,7 +123,7 @@ object DeadshotClient : ClientModInitializer {
             }
             val target = lockedTarget
             if (target != null) {
-                aimBowWithTruePrediction(player, target)
+                aimBowAdaptive(player, target)
             }
             return
         }
@@ -137,7 +132,7 @@ object DeadshotClient : ClientModInitializer {
             lockedTarget = null
         }
 
-        // 2. نظام الايم العام (للأسلحة والأيدي)
+        // 2. نظام الايم العام
         if (meleeAimEnabled) {
             val target = findBestTargetByCrosshair(player, 5.5) ?: return
             aimDirect(player, getAimPoint(target))
@@ -180,66 +175,53 @@ object DeadshotClient : ClientModInitializer {
         player.xRot = pitch
     }
 
-    // تنعيم وحساب حركة الكائن مع معالجة حركة الخفاش العشوائية
-    private fun getFilteredVelocity(target: LivingEntity): Vec3 {
-        val currentPos = Vec3(target.x, target.y, target.z)
-        val prevPos = lastPositions[target.id]
-        lastPositions[target.id] = currentPos
-
-        val instantVel = if (prevPos != null) {
-            currentPos.subtract(prevPos)
-        } else {
-            Vec3(target.x - target.xo, target.y - target.yo, target.z - target.zo)
-        }
-
-        val oldSmoothed = smoothedVelocities[target.id] ?: instantVel
-        // تنعيم بنسبة 60% للسرعة الجديدة و40% للقديمة لمنع تشتت الايم عند حركة الخفاش الحادة
-        val smooth = Vec3(
-            oldSmoothed.x * 0.4 + instantVel.x * 0.6,
-            oldSmoothed.y * 0.4 + instantVel.y * 0.6,
-            oldSmoothed.z * 0.4 + instantVel.z * 0.6
-        )
-        smoothedVelocities[target.id] = smooth
-
-        // الخفاش والكائنات الطائرة العشوائية نهدئ معامل حركتها حتى ما يروح السهم بعيد عنها
-        val dampFactor = if (target is Bat) 0.6 else 1.0
-        return smooth.scale(dampFactor)
+    // حساب سرعة الكائن اللحظية المباشرة (0ms Delay بدون أي تنعيم متأخر)
+    private fun getInstantVelocity(target: LivingEntity): Vec3 {
+        val vx = target.x - target.xo
+        val vy = target.y - target.yo
+        val vz = target.z - target.zo
+        val vel = Vec3(vx, vy, vz)
+        return if (vel.lengthSqr() > 1e-6) vel else target.deltaMovement
     }
 
-    // توجيه القوس نحو الصدر/الرأس مع تعويض السقوط وحساب المسار
-    private fun aimBowWithTruePrediction(player: Player, target: LivingEntity) {
+    // توجيه القوس بنظام التوقع الذكي والمحكوم (Adaptive Clamped Lead)
+    private fun aimBowAdaptive(player: Player, target: LivingEntity) {
         val eyePos = player.eyePosition
         val aimPoint = getAimPoint(target)
 
         val useTicks = player.ticksUsingItem
         var arrowSpeed = BowItem.getPowerForTime(useTicks).toDouble() * 3.0
         if (arrowSpeed < 0.1) arrowSpeed = 1.0
-        val effectiveSpeed = arrowSpeed * 0.95
+        val effectiveSpeed = arrowSpeed * 0.96
 
-        val vel = getFilteredVelocity(target)
+        val dist = eyePos.distanceTo(aimPoint)
+        val flightTime = dist / effectiveSpeed
 
-        var predictedPos = aimPoint
-        var flightTime = 0.0
+        // سرعة الكائن اللحظية
+        val vel = getInstantVelocity(target)
 
-        for (i in 0..2) {
-            val dist = eyePos.distanceTo(predictedPos)
-            flightTime = dist / effectiveSpeed
-            predictedPos = Vec3(
-                aimPoint.x + (vel.x * flightTime),
-                aimPoint.y + (vel.y * flightTime).coerceIn(-1.2, 1.2),
-                aimPoint.z + (vel.z * flightTime)
-            )
+        // نحدد سقف التوقع: للخفاش 0.75 بلوكة كحد أقصى، وللوحوش العادية 2.0 بلوكة
+        // حتى مستحيل السهم يطير بعيد في الهواء إذا كسر الكائن يمين أو يسار فجأة
+        val maxLead = if (target is Bat) 0.75 else 2.0
+        var leadVector = Vec3(vel.x * flightTime, vel.y * flightTime * 0.5, vel.z * flightTime)
+        if (leadVector.length() > maxLead) {
+            leadVector = leadVector.normalize().scale(maxLead)
         }
 
-        val dx = predictedPos.x - eyePos.x
-        val dz = predictedPos.z - eyePos.z
+        val predictedX = aimPoint.x + leadVector.x
+        val predictedZ = aimPoint.z + leadVector.z
+        val predictedY = aimPoint.y + leadVector.y.coerceIn(-0.6, 0.6)
+
+        val dx = predictedX - eyePos.x
+        val dz = predictedZ - eyePos.z
         val horizontalDist = sqrt(dx * dx + dz * dz)
 
+        // حساب سقوط السهم بالجاذبية
         val gravity = 0.05
-        val drop = 0.5 * gravity * flightTime * flightTime
+        val time = horizontalDist / effectiveSpeed
+        val drop = 0.5 * gravity * time * time
 
-        // استهداف النقطة المرتفعة مع إضافة تعويض الجاذبية
-        val targetY = predictedPos.y + drop
+        val targetY = predictedY + drop
         val dy = targetY - eyePos.y
 
         val yaw = (Math.toDegrees(atan2(dz, dx)) - 90.0).toFloat()
