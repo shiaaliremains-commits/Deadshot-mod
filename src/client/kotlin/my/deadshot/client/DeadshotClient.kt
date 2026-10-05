@@ -14,6 +14,7 @@ import net.minecraft.network.chat.Component
 import net.minecraft.resources.Identifier
 import net.minecraft.util.Mth
 import net.minecraft.world.entity.LivingEntity
+import net.minecraft.world.entity.ambient.Bat
 import net.minecraft.world.entity.decoration.ArmorStand
 import net.minecraft.world.entity.player.Player
 import net.minecraft.world.item.BowItem
@@ -27,9 +28,9 @@ object DeadshotClient : ClientModInitializer {
     private var meleeAimEnabled = true
     private var lockedTarget: LivingEntity? = null
 
-    // ذاكرة لتسجيل سرعة وحركة الكائنات الحقيقية في كل تيك
+    // ذاكرة متقدمة لحفظ وتنعيم سرعة الكائنات
     private val lastPositions = HashMap<Int, Vec3>()
-    private val entityVelocities = HashMap<Int, Vec3>()
+    private val smoothedVelocities = HashMap<Int, Vec3>()
 
     private lateinit var toggleBowKey: KeyMapping
     private lateinit var toggleMeleeKey: KeyMapping
@@ -107,6 +108,15 @@ object DeadshotClient : ClientModInitializer {
         return player.hasLineOfSight(target)
     }
 
+    // نقطة استهداف ذكية لارتفاع الصدر والرأس بدل الرجلين
+    private fun getAimPoint(target: LivingEntity): Vec3 {
+        val bb = target.boundingBox
+        val height = bb.maxY - bb.minY
+        // للكائنات الصغيرة نأخذ أعلى الصدر، وللكائنات العادية 70% من الارتفاع (منطقة الصدر/الرأس)
+        val yOffset = if (height < 1.0) height * 0.55 else height * 0.70
+        return Vec3(bb.minX + (bb.maxX - bb.minX) * 0.5, bb.minY + yOffset, bb.minZ + (bb.maxZ - bb.minZ) * 0.5)
+    }
+
     private fun handleAim(player: Player) {
         val isBow = player.isUsingItem && (player.useItem.item is BowItem || player.useItem.item is CrossbowItem)
 
@@ -127,16 +137,16 @@ object DeadshotClient : ClientModInitializer {
             lockedTarget = null
         }
 
-        // 2. نظام الايم العام
+        // 2. نظام الايم العام (للأسلحة والأيدي)
         if (meleeAimEnabled) {
             val target = findBestTargetByCrosshair(player, 5.5) ?: return
-            aimDirect(player, target.boundingBox.center)
+            aimDirect(player, getAimPoint(target))
         }
     }
 
     private fun angleToCrosshair(player: Player, target: LivingEntity): Double {
         val eyePos = player.eyePosition
-        val toTarget = target.boundingBox.center.subtract(eyePos).normalize()
+        val toTarget = getAimPoint(target).subtract(eyePos).normalize()
         val look = player.lookAngle.normalize()
         val dot = look.dot(toTarget).coerceIn(-1.0, 1.0)
         return Math.toDegrees(acos(dot))
@@ -170,51 +180,54 @@ object DeadshotClient : ClientModInitializer {
         player.xRot = pitch
     }
 
-    // حساب السرعة الحقيقية للكائن بدقة من الإحداثيات الفعلية (وليس deltaMovement المفرغة)
-    private fun getRealVelocity(target: LivingEntity): Vec3 {
+    // تنعيم وحساب حركة الكائن مع معالجة حركة الخفاش العشوائية
+    private fun getFilteredVelocity(target: LivingEntity): Vec3 {
         val currentPos = Vec3(target.x, target.y, target.z)
         val prevPos = lastPositions[target.id]
         lastPositions[target.id] = currentPos
 
-        val calculated = if (prevPos != null) {
+        val instantVel = if (prevPos != null) {
             currentPos.subtract(prevPos)
         } else {
             Vec3(target.x - target.xo, target.y - target.yo, target.z - target.zo)
         }
 
-        // حفظ وتنعيم السرعة
-        val realVel = if (calculated.lengthSqr() > 1e-6) calculated else target.deltaMovement
-        entityVelocities[target.id] = realVel
-        return realVel
+        val oldSmoothed = smoothedVelocities[target.id] ?: instantVel
+        // تنعيم بنسبة 60% للسرعة الجديدة و40% للقديمة لمنع تشتت الايم عند حركة الخفاش الحادة
+        val smooth = Vec3(
+            oldSmoothed.x * 0.4 + instantVel.x * 0.6,
+            oldSmoothed.y * 0.4 + instantVel.y * 0.6,
+            oldSmoothed.z * 0.4 + instantVel.z * 0.6
+        )
+        smoothedVelocities[target.id] = smooth
+
+        // الخفاش والكائنات الطائرة العشوائية نهدئ معامل حركتها حتى ما يروح السهم بعيد عنها
+        val dampFactor = if (target is Bat) 0.6 else 1.0
+        return smooth.scale(dampFactor)
     }
 
-    // توجيه القوس مع حساب نقطة الاعتراض المستقبلي لحركة الكائن (Lead Aiming)
+    // توجيه القوس نحو الصدر/الرأس مع تعويض السقوط وحساب المسار
     private fun aimBowWithTruePrediction(player: Player, target: LivingEntity) {
         val eyePos = player.eyePosition
-        val targetCenter = target.boundingBox.center
+        val aimPoint = getAimPoint(target)
 
-        // حساب سرعة السهم الأولية
         val useTicks = player.ticksUsingItem
         var arrowSpeed = BowItem.getPowerForTime(useTicks).toDouble() * 3.0
         if (arrowSpeed < 0.1) arrowSpeed = 1.0
-
-        // السرعة الفعالة للسهم مع احتساب مقاومة الهواء (0.99 Drag)
         val effectiveSpeed = arrowSpeed * 0.95
 
-        // السرعة الحقيقية لحركة الكائن (بلوك / تيك)
-        val vel = getRealVelocity(target)
+        val vel = getFilteredVelocity(target)
 
-        // حل تكراري (2-Step Iterative Solver) لحساب نقطة الاصطدام بدقة 100%
-        var predictedPos = targetCenter
+        var predictedPos = aimPoint
         var flightTime = 0.0
 
         for (i in 0..2) {
             val dist = eyePos.distanceTo(predictedPos)
             flightTime = dist / effectiveSpeed
             predictedPos = Vec3(
-                targetCenter.x + (vel.x * flightTime),
-                targetCenter.y + (vel.y * flightTime).coerceIn(-1.2, 1.2),
-                targetCenter.z + (vel.z * flightTime)
+                aimPoint.x + (vel.x * flightTime),
+                aimPoint.y + (vel.y * flightTime).coerceIn(-1.2, 1.2),
+                aimPoint.z + (vel.z * flightTime)
             )
         }
 
@@ -222,10 +235,10 @@ object DeadshotClient : ClientModInitializer {
         val dz = predictedPos.z - eyePos.z
         val horizontalDist = sqrt(dx * dx + dz * dz)
 
-        // حساب سقوط السهم بفعل الجاذبية (0.05 بلوك لكل تيك تربيع)
         val gravity = 0.05
         val drop = 0.5 * gravity * flightTime * flightTime
 
+        // استهداف النقطة المرتفعة مع إضافة تعويض الجاذبية
         val targetY = predictedPos.y + drop
         val dy = targetY - eyePos.y
 
