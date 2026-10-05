@@ -1,6 +1,7 @@
 package my.deadshot.client
 
 import com.mojang.blaze3d.platform.InputConstants
+import kotlin.math.acos
 import kotlin.math.atan2
 import kotlin.math.sqrt
 import net.fabricmc.api.ClientModInitializer
@@ -25,6 +26,9 @@ object DeadshotClient : ClientModInitializer {
     private var bowAimEnabled = true
     private var meleeAimEnabled = true
 
+    // قفل الهدف حتى ما يتشتت الايم بين الوحوش أثناء الشد
+    private var lockedTarget: LivingEntity? = null
+
     private lateinit var toggleBowKey: KeyMapping
     private lateinit var toggleMeleeKey: KeyMapping
     private var screenProbe: ((Minecraft) -> Any?)? = null
@@ -32,12 +36,10 @@ object DeadshotClient : ClientModInitializer {
     override fun onInitializeClient() {
         val category = KeyMapping.Category.register(Identifier.fromNamespaceAndPath(MOD_ID, "main"))
 
-        // زر تفعيل/تعطيل ايم القوس (حرف V)
         toggleBowKey = KeyMappingHelper.registerKeyMapping(
             KeyMapping("key.deadshot.toggle_bow", InputConstants.KEY_V, category)
         )
 
-        // زر تفعيل/تعطيل الايم العام لجميع الأسلحة ولليد الفارغة (حرف X)
         toggleMeleeKey = KeyMappingHelper.registerKeyMapping(
             KeyMapping("key.deadshot.toggle_melee", InputConstants.KEY_X, category)
         )
@@ -97,31 +99,64 @@ object DeadshotClient : ClientModInitializer {
         )
     }
 
+    private fun isValidTarget(player: Player, target: LivingEntity?, range: Double): Boolean {
+        if (target == null || !target.isAlive || target == player || target is ArmorStand) return false
+        if (player.distanceTo(target) > range) return false
+        return player.hasLineOfSight(target)
+    }
+
     private fun handleAim(player: Player) {
         val isBow = player.isUsingItem && (player.useItem.item is BowItem || player.useItem.item is CrossbowItem)
 
-        // 1. نظام القوس
+        // 1. نظام القوس (مدى يصل لـ 75 بلوكة مع تثبيت وتوقع حركة)
         if (isBow && bowAimEnabled) {
-            val target = findTarget(player, 45.0) ?: return
-            aimBow(player, target)
+            val maxRange = 75.0
+            if (!isValidTarget(player, lockedTarget, maxRange)) {
+                lockedTarget = findBestTargetByCrosshair(player, maxRange)
+            }
+            val target = lockedTarget
+            if (target != null) {
+                aimBowWithPrediction(player, target)
+            }
             return
         }
 
-        // 2. نظام الايم العام (لأي سلاح أو بدون سلاح)
-        if (meleeAimEnabled && !isBow) {
-            val target = findTarget(player, 5.5) ?: return
+        // إذا فلت القوس، يلغي قفل الهدف ليكون مستعد للهدف القادم
+        if (!isBow) {
+            lockedTarget = null
+        }
+
+        // 2. نظام الايم العام (للأسلحة واليد ضمن 5.5 بلوكات بالأقرب لمؤشر الشاشة)
+        if (meleeAimEnabled) {
+            val target = findBestTargetByCrosshair(player, 5.5) ?: return
             aimDirect(player, target.boundingBox.center)
         }
     }
 
-    private fun findTarget(player: Player, range: Double): LivingEntity? {
+    // حساب زاوية انحراف الكائن عن منتصف شاشة اللاعب (Crosshair)
+    private fun angleToCrosshair(player: Player, target: LivingEntity): Double {
+        val eyePos = player.eyePosition
+        val toTarget = target.boundingBox.center.subtract(eyePos).normalize()
+        val look = player.lookAngle.normalize()
+        val dot = look.dot(toTarget).coerceIn(-1.0, 1.0)
+        return Math.toDegrees(acos(dot)) // 0 درجة يعني بنصف الـ Crosshair تماماً
+    }
+
+    // يختار الكائن الأقرب لمنتصف الشاشة بدقة عالية
+    private fun findBestTargetByCrosshair(player: Player, range: Double): LivingEntity? {
         val level = player.level()
         val box = player.boundingBox.inflate(range)
         val entities = level.getEntitiesOfClass(LivingEntity::class.java, box) {
             it != player && it.isAlive && it !is ArmorStand && player.hasLineOfSight(it)
         }
 
-        return entities.minByOrNull { player.distanceTo(it) }
+        // يفرز حسب زاوية الشاشة أولاً، ثم المسافة
+        return entities.minByOrNull { entity ->
+            val angle = angleToCrosshair(player, entity)
+            val dist = player.distanceTo(entity)
+            // إعطاء وزن أكبر للزاوية أمام اللاعب حتى ما يلتفت للوراء
+            angle * 1.8 + dist * 0.4
+        }
     }
 
     private fun aimDirect(player: Player, targetPos: Vec3) {
@@ -138,23 +173,38 @@ object DeadshotClient : ClientModInitializer {
         player.xRot = pitch
     }
 
-    private fun aimBow(player: Player, target: LivingEntity) {
+    // توجيه القوس مع حساب الجاذبية وتوقع حركة الكائن (Lead Prediction)
+    private fun aimBowWithPrediction(player: Player, target: LivingEntity) {
         val eyePos = player.eyePosition
-        val targetPos = target.boundingBox.center
-        val dx = targetPos.x - eyePos.x
-        val dz = targetPos.z - eyePos.z
-        val horizontalDist = sqrt(dx * dx + dz * dz)
+        val currentCenter = target.boundingBox.center
 
-        // حساب وقت الشد بدقة عبر ticksUsingItem
+        // حساب سرعة انطلاق السهم من قوة الشد
         val useTicks = player.ticksUsingItem
         var velocity = BowItem.getPowerForTime(useTicks).toDouble() * 3.0
         if (velocity < 0.1) velocity = 1.0
 
+        // المسافة ووقت طيران السهم المقدر في التيك
+        val currentDist = eyePos.distanceTo(currentCenter)
+        val flightTime = currentDist / velocity
+
+        // قراءة سرعة حركة الكائن الحالية لتوقع مكانه المستقبلي
+        val movement = target.deltaMovement
+        // توقع الموقع المستقبلي (X و Z) بناء على سرعة الكائن ووقت وصول السهم
+        val predictedX = currentCenter.x + (movement.x * flightTime)
+        val predictedZ = currentCenter.z + (movement.z * flightTime)
+        // حركة الـ Y نحددها بحدود بسيطة لتجنب تشتت الايم عند القفز
+        val predictedY = currentCenter.y + (movement.y * flightTime).coerceIn(-0.8, 0.8)
+
+        val dx = predictedX - eyePos.x
+        val dz = predictedZ - eyePos.z
+        val horizontalDist = sqrt(dx * dx + dz * dz)
+
+        // حساب سقوط السهم بالجاذبية
         val gravity = 0.05
         val time = horizontalDist / velocity
         val drop = 0.5 * gravity * time * time
 
-        val targetY = targetPos.y + drop
+        val targetY = predictedY + drop
         val dy = targetY - eyePos.y
 
         val yaw = (Math.toDegrees(atan2(dz, dx)) - 90.0).toFloat()
