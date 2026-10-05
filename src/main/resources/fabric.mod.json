@@ -1,0 +1,51 @@
+{
+	"schemaVersion": 1,
+	"id": "deadshot",
+	"version": "${version}",
+	"name": "deadshot",
+	"description": "This is an example description! Tell everyone what your mod is about!",
+	"authors": [
+		"Me!"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/deadshot/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			{
+				"value": "my.deadshot.Deadshot",
+				"adapter": "kotlin"
+			}
+		],
+		"client": [
+			{
+				"value": "my.deadshot.client.DeadshotClient",
+				"adapter": "kotlin"
+			}
+		],
+		"fabric-datagen": [
+			{
+				"value": "my.deadshot.client.DeadshotDataGenerator",
+				"adapter": "kotlin"
+			}
+		]
+	},
+	"mixins": [
+		"deadshot.mixins.json",
+		{
+			"config": "deadshot.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*",
+		"fabric-language-kotlin": "*"
+	}
+}
